@@ -137,17 +137,31 @@ def adtnorm(data: Union[pd.DataFrame,anndata.AnnData,mudata.MuData],
                 adtnorm_res.index = adtnorm_res.index.astype(index_dtype)
                 data.obsm[return_location] = adtnorm_res
             else:
-                if not set(marker_to_process) == set(data.var_names):
+                full_cols = list(data.var_names)
+                adtnorm_res = pd.DataFrame(adtnorm_res, index=obs.index, columns=marker_to_process)
+                # Fallback policy for markers we didn’t process
+                missing = [c for c in full_cols if c not in adtnorm_res.columns]
+                if missing:
                     if verbose:
-                        print('Warning, marker_to_process does not include all columns, filling other markers with NA.')
-                    adtnorm_res[list(set(data.var_names)-set(marker_to_process))] = None
-                adtnorm_res = adtnorm_res.loc[:,data.var_names].astype(float)
+                        print(f"{len(missing)} markers not processed; filling from raw '{ADT_location}' instead of NA.")
+                    if ADT_location is None:
+                        raw_block = pd.DataFrame(data.X, index=data.obs_names, columns=data.var_names)[missing]
+                    elif ADT_location in data.layers.keys():
+                        raw_block = pd.DataFrame(data.layers[ADT_location], index=data.obs_names, columns=data.var_names)[missing]
+                    elif ADT_location in data.obsm.keys():
+                        raw_block = pd.DataFrame(data.obsm[ADT_location], index=data.obs_names)[missing]
+                    else:
+                        raise AssertionError(f"Could not find ADT expression in '{ADT_location}' to backfill missing markers.")
+                    adtnorm_res = pd.concat([adtnorm_res, raw_block], axis=1)
+
+                # Final align + type
+                adtnorm_res = adtnorm_res.reindex(columns=full_cols).astype(np.float32)
+
                 if return_location is None:
                     data.X = adtnorm_res.values
                 else:
                     data.layers[return_location] = adtnorm_res.values
     return data
-            
 def _adtnorm(ADT_data, obs,marker_to_process,customize_landmark, save_landmark, verbose, override_landmark, **kwargs):
     # Loading the R function
     ADTnormR = load_adtnorm_R(verbose)
