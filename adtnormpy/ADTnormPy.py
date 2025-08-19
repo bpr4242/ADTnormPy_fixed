@@ -341,152 +341,206 @@ def load_python_landmarks(load_dir, study_name='ADTnormPy', append_csv=True):
 
     return res
 from joblib import Parallel, delayed
+import numpy as np
+import pandas as pd
+import os, sys, tempfile
+from typing import Optional, List
 
-def _log(msg, prefix=None, enable=True):
-    if not enable:
-        return
-    if prefix:
-        sys.stdout.write(f"[{prefix}] {msg}\n")
-    else:
-        sys.stdout.write(f"{msg}\n")
+# ---------- tiny logging helpers ----------
+def _log(msg: str, marker: str = None, ts: bool = False):
+    if marker:
+        msg = f"[{marker}] {msg}"
+    if ts:
+        from datetime import datetime
+        msg = f"{datetime.now().strftime('%H:%M:%S')} {msg}"
+    sys.stdout.write(msg + "\n")
     sys.stdout.flush()
 
-def _extract_raw_column(data, marker, ADT_location):
-    """Return raw values for one marker as float32 1D array."""
-    if isinstance(data, anndata.AnnData):
-        if ADT_location is None:
-            j = data.var_names.get_loc(marker)
-            col = data.X[:, j]
-            return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
-        elif ADT_location in data.layers:
-            arr = data.layers[ADT_location]
-            j = data.var_names.get_loc(marker)
-            col = arr[:, j]
-            return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
-        else:  # obsm
-            return pd.Series(data.obsm[ADT_location][marker].values).to_numpy(dtype=np.float32)
+def _print_r_file(path: str, marker: str):
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if line:
+                    _log(f"R> {line}", marker=marker)
+    except Exception as e:
+        _log(f"(could not read R sink file {path}: {e})", marker=marker)
 
-    # MuData
-    if hasattr(data, "mod"):
-        mod = data.mod[ADT_location]
-        j = mod.var_names.get_loc(marker)
-        col = mod.X[:, j]
-        return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
+# ---------- capture R stdout/stderr via sink() ----------
+# We guard this so it only runs in the worker processes.
+def _r_capture_context(stdout_path: str, stderr_path: str):
+    import contextlib
+    import rpy2.robjects as ro
+    @contextlib.contextmanager
+    def _ctx():
+        ro.r(f'sink("{stdout_path}", type="output")')
+        ro.r(f'sink("{stderr_path}", type="message")')
+        try:
+            yield
+        finally:
+            # drain all sinks safely
+            ro.r('while (sink.number(type="output")>0) sink(NULL, type="output")')
+            ro.r('while (sink.number(type="message")>0) sink(NULL, type="message")')
+    return _ctx()
 
-    # DataFrame
-    return data[marker].to_numpy(dtype=np.float32)
-
-def _extract_result_column(res, marker, return_location):
-    """Pull the single marker column from the adtnorm() result, regardless of container type."""
+# ---------- helpers to extract columns & raw fallbacks ----------
+def _extract_marker_column_from_result(res, marker: str, return_location: str):
+    import numpy as np
+    import anndata
+    # AnnData
     if isinstance(res, anndata.AnnData):
         arr = res.layers[return_location] if return_location in res.layers else res.X
         j = res.var_names.get_loc(marker)
         col = arr[:, j]
         return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
-
-    if hasattr(res, "mod"):  # MuData
-        mod = res.mod[return_location]
-        j = mod.var_names.get_loc(marker)
-        col = mod.X[:, j]
-        return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
-
+    # MuData
+    if hasattr(res, "mod"):
+        arr = res.mod[return_location].X
+        j = res.mod[return_location].var_names.get_loc(marker)
+        return np.asarray(arr[:, j]).astype(np.float32)
     # DataFrame
     return res[marker].to_numpy(dtype=np.float32)
 
-def _run_one_marker(marker, data, sample_column, ADT_location, return_location, kwargs, verbose=True):
-    """Worker: run adtnorm() on a single marker with verbose logging, fallback to raw on failure."""
-    _log("starting ADTnorm", prefix=marker, enable=verbose)
-    t0 = time.time()
+def _raw_marker_column(data, marker: str, ADT_location: Optional[str] = 'protein'):
+    import numpy as np
+    import anndata
+    # AnnData
+    if isinstance(data, anndata.AnnData):
+        if ADT_location is None:
+                j = data.var_names.get_loc(marker)
+                col = data.X[:, j]
+                return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
+        elif ADT_location in data.layers:
+            col = data.layers[ADT_location][:, data.var_names.get_loc(marker)]
+        else:
+            col = data.obsm[ADT_location][marker].values
+        return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
+    # MuData
+    if hasattr(data, "mod"):
+        col = data.mod[ADT_location][:, marker].X
+        return (col.A1 if hasattr(col, "A1") else np.asarray(col)).astype(np.float32)
+    # DataFrame
+    return data[marker].to_numpy(dtype=np.float32)
+
+# ---------- single-marker worker (super verbose) ----------
+def _run_one_marker_verbose(marker: str,
+                            data,
+                            sample_column: str,
+                            ADT_location: str,
+                            return_location: str,
+                            r_verbose_level: int = 2,
+                            show_params: bool = True,
+                            timestamp_logs: bool = True,
+                            **kwargs):
+    """
+    Runs your existing `adtnorm()` for a single marker with:
+     - R verbosity forced via verbose=r_verbose_level
+     - R stdout/stderr captured and reprinted with [marker] prefix
+     - raw fallback on failure
+    """
+    from copy import deepcopy
+    import traceback
+
+    _log("Starting", marker=marker, ts=timestamp_logs)
+    if show_params:
+        params_str = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        _log(f"Params: sample_column={sample_column}, ADT_location={ADT_location}, return_location={return_location}"
+             + (f" | extra: {params_str}" if params_str else ""), marker=marker, ts=timestamp_logs)
+
+    # each worker gets its own temp files for R sinks
+    tmpdir = tempfile.mkdtemp(prefix=f"adtnorm_{marker}_")
+    r_out = os.path.join(tmpdir, "R_stdout.txt")
+    r_err = os.path.join(tmpdir, "R_stderr.txt")
+
     try:
-        # import inside worker so each process gets its own rpy2/R
-        res = adtnorm(
-            data=data.copy(),
-            sample_column=sample_column,
-            marker_to_process=[marker],
-            ADT_location=ADT_location,
-            return_location=return_location,
-            customize_landmark=False,          # interactive off in parallel
-            verbose=True,                      # make R chatty
-            **kwargs
-        )
-        col = _extract_result_column(res, marker, return_location)
-        dt = time.time() - t0
-        _log(f"finished in {dt:.2f}s", prefix=marker, enable=verbose)
-        # sanitize: replace any NaN/Inf with raw
+        # shallow copy avoids mutating caller's object in workers
+        d = data.copy()
+
+        # capture ALL R chatter
+        with _r_capture_context(r_out, r_err):
+            res = adtnorm(
+                data=d,
+                sample_column=sample_column,
+                marker_to_process=[marker],
+                ADT_location=ADT_location,
+                return_location=return_location,
+                customize_landmark=False,         # must be non-interactive in parallel
+                verbose=r_verbose_level,          # 2 => True inside your _adtnorm(), prints like original
+                **kwargs
+            )
+
+        # print captured R logs with prefixes
+        _print_r_file(r_out, marker)
+        _print_r_file(r_err, marker)
+
+        col = _extract_marker_column_from_result(res, marker, return_location)
+        # final guard: replace any NaN with raw
         if not np.isfinite(col).all():
-            _log("non-finite values detected; falling back to raw for those cells", prefix=marker, enable=verbose)
-            raw = _extract_raw_column(data, marker, ADT_location)
+            _log("NaNs detected in normalized values, replacing with raw.", marker=marker)
+            raw = _raw_marker_column(data, marker, ADT_location)
             bad = ~np.isfinite(col)
             col[bad] = raw[bad]
+        _log(f"Done (n_cells={col.size})", marker=marker, ts=timestamp_logs)
         return marker, col
+
     except Exception as e:
-        dt = time.time() - t0
-        _log(f"FAILED in {dt:.2f}s: {repr(e)}", prefix=marker, enable=verbose)
-        _log(traceback.format_exc().rstrip(), prefix=marker, enable=verbose)
-        # fallback: raw column
-        raw = _extract_raw_column(data, marker, ADT_location)
+        _log(f"ERROR: {type(e).__name__}: {e}", marker=marker, ts=timestamp_logs)
+        # try to flush R logs even on error
+        _print_r_file(r_out, marker)
+        _print_r_file(r_err, marker)
+        _log("Falling back to RAW for this marker.", marker=marker)
+        raw = _raw_marker_column(data, marker, ADT_location)
         return marker, raw
 
-def _run_chunk(chunk, data, sample_column, ADT_location, return_location, kwargs, verbose=True):
-    """Worker: run adtnorm() on a small batch of markers to amortize R startup."""
-    tag = f"chunk({len(chunk)}):{','.join(chunk[:3])}{'...' if len(chunk)>3 else ''}"
-    _log("starting ADTnorm", prefix=tag, enable=verbose)
-    t0 = time.time()
-    out = {}
-    try:
-        res = adtnorm(
-            data=data.copy(),
-            sample_column=sample_column,
-            marker_to_process=chunk,
-            ADT_location=ADT_location,
-            return_location=return_location,
-            customize_landmark=False,
-            verbose=True,      # R verbose
-            **kwargs
-        )
-        for m in chunk:
-            try:
-                col = _extract_result_column(res, m, return_location)
-                if not np.isfinite(col).all():
-                    raw = _extract_raw_column(data, m, ADT_location)
-                    bad = ~np.isfinite(col)
-                    col[bad] = raw[bad]
-                out[m] = col.astype(np.float32, copy=False)
-            except Exception:
-                _log(f"marker {m} failed inside chunk; using raw", prefix=tag, enable=verbose)
-                out[m] = _extract_raw_column(data, m, ADT_location)
-        dt = time.time() - t0
-        _log(f"finished in {dt:.2f}s", prefix=tag, enable=verbose)
-        return out
-    except Exception as e:
-        dt = time.time() - t0
-        _log(f"FAILED in {dt:.2f}s: {repr(e)}", prefix=tag, enable=verbose)
-        _log(traceback.format_exc().rstrip(), prefix=tag, enable=verbose)
-        # fallback: raw for whole chunk
-        for m in chunk:
-            out[m] = _extract_raw_column(data, m, ADT_location)
-        return out
-
-def adtnorm_parallel_markers(
-    data,
-    sample_column="sample",
-    ADT_location="protein",
-    return_location="ADTnorm",
-    markers=None,
-    n_jobs=4,
-    chunk_size=1,
-    verbose=True,
-    **kwargs
-):
+# ---------- public API: parallel per-marker (or small chunks) ----------
+def adtnorm_parallel_markers(data,
+                             sample_column: str = "sample",
+                             ADT_location: str = "protein",
+                             return_location: str = "ADTnorm",
+                             markers: Optional[List[str]] = None,
+                             n_jobs: int = 4,
+                             chunk_size: int = 1,
+                             verbose: bool = True,
+                             r_verbose_level: int = 2,
+                             show_params: bool = True,
+                             timestamp_logs: bool = True,
+                             **kwargs):
     """
-    Parallel per-marker (or small chunk) ADTnorm with verbose logging.
+    Super-verbose parallel ADTnorm runner.
 
-    - Each worker runs in a separate process (safe for rpy2/R).
-    - ADTnorm R prints are enabled (verbose=True) and prefixed by marker/chunk.
-    - Any NaN/Inf from ADTnorm is replaced cell-by-cell with the raw input values.
-    - Unprocessed markers are backfilled from the raw input (no holes).
+    Parameters
+    ----------
+    data : AnnData | MuData | pd.DataFrame
+    sample_column : str
+    ADT_location : str
+        For AnnData: layer key (or None for .X, or obsm key for DataFrame input)
+        For MuData: modality key
+    return_location : str
+        Destination layer/modality name for normalized output.
+    markers : list[str] | None
+        Default: all markers. Subset for testing.
+    n_jobs : int
+        Number of parallel processes (loky backend).
+    chunk_size : int
+        >1 to amortize R startup by processing small groups per worker.
+    verbose : bool
+        Controls Python-side chatter (prefixes); R prints are controlled by r_verbose_level.
+    r_verbose_level : int
+        Passed through to your `adtnorm(... verbose=...)` (2 → original-level R prints).
+    show_params : bool
+        Print the kwargs being passed for reproducibility.
+    timestamp_logs : bool
+        Prefix logs with HH:MM:SS times.
+
+    Returns
+    -------
+    data (with `return_location` filled) or a DataFrame (if input was DataFrame).
     """
-    # Build the complete marker list for the container
+    import anndata
+
+    # Resolve all marker names from the input container
     if isinstance(data, anndata.AnnData):
         all_markers = list(data.var_names)
     elif hasattr(data, "mod"):  # MuData
@@ -499,80 +553,102 @@ def adtnorm_parallel_markers(
     else:
         markers = [m for m in markers if m in all_markers]
 
-    # Parallel execution
+    if verbose:
+        _log(f"Parallel ADTnorm starting: {len(markers)} markers | n_jobs={n_jobs} | chunk_size={chunk_size}")
+
+    # ---- run in parallel ----
     if chunk_size > 1:
+        # process small batches per worker to reduce R startup overhead
         chunks = [markers[i:i+chunk_size] for i in range(0, len(markers), chunk_size)]
-        results = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(_run_chunk)(c, data, sample_column, ADT_location, return_location, kwargs, verbose)
-            for c in chunks
-        )
+
+        def _runner_chunk(chunk):
+            out = {}
+            # run each marker in the chunk with full verbosity & capture
+            for m in chunk:
+                k, col = _run_one_marker_verbose(
+                    m, data, sample_column, ADT_location, return_location,
+                    r_verbose_level=r_verbose_level,
+                    show_params=show_params,
+                    timestamp_logs=timestamp_logs,
+                    **kwargs
+                )
+                out[k] = col
+            return out
+
+        results = Parallel(n_jobs=n_jobs, backend="loky")(delayed(_runner_chunk)(c) for c in chunks)
         col_map = {}
         for dct in results:
             col_map.update(dct)
     else:
+        # one marker per process
         results = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(_run_one_marker)(m, data, sample_column, ADT_location, return_location, kwargs, verbose)
-            for m in markers
+            delayed(_run_one_marker_verbose)(
+                m, data, sample_column, ADT_location, return_location,
+                r_verbose_level=r_verbose_level,
+                show_params=show_params,
+                timestamp_logs=timestamp_logs,
+                **kwargs
+            ) for m in markers
         )
         col_map = {m: col for m, col in results}
 
-    # Stitch back in the original order, backfilling any gaps from raw
+    # ---- stitch back in original order; backfill gaps from raw; final NaN guard ----
     if isinstance(data, anndata.AnnData):
-        n = data.n_obs
-        p = len(all_markers)
-        M = np.empty((n, p), dtype=np.float32); M[:] = np.nan
+        n, P = data.n_obs, len(all_markers)
+        M = np.empty((n, P), dtype=np.float32); M[:] = np.nan
+
         for j, m in enumerate(all_markers):
             if m in col_map:
                 M[:, j] = col_map[m]
             else:
-                # not processed → raw
-                M[:, j] = _extract_raw_column(data, m, ADT_location)
+                if verbose:
+                    _log(f"Note: marker {m} was not processed; backfilling from raw.")
+                M[:, j] = _raw_marker_column(data, m, ADT_location)
 
-        # final cell-by-cell NaN→raw guard
+        # per-cell NaN → raw
         if ADT_location is None:
             raw_full = data.X
         elif ADT_location in data.layers:
             raw_full = data.layers[ADT_location]
         else:
-            raw_full = data.obsm[ADT_location].values  # DataFrame->ndarray
-        raw_np = raw_full if isinstance(raw_full, np.ndarray) else np.asarray(raw_full)
+            raw_full = data.obsm[ADT_location]
+        raw_np = raw_full if isinstance(raw_full, np.ndarray) else (raw_full.values if hasattr(raw_full, "values") else np.asarray(raw_full))
         bad = ~np.isfinite(M)
         if bad.any():
+            if verbose:
+                _log(f"Final guard: {int(bad.sum())} NaN/inf values → raw fallback")
             M[bad] = raw_np[bad]
 
         data.layers[return_location] = M
-        _log(f"wrote layer '{return_location}' with shape {M.shape}", enable=verbose)
+        if verbose:
+            _log(f"Done. Wrote layer '{return_location}' with shape {M.shape}")
         return data
 
-    if hasattr(data, "mod"):  # MuData
-        mod_in = data.mod[ADT_location]
-        n = mod_in.n_obs
-        p = len(all_markers)
-        M = np.empty((n, p), dtype=np.float32); M[:] = np.nan
+    elif hasattr(data, "mod"):  # MuData
+        n = data.mod[ADT_location].n_obs
+        P = len(all_markers)
+        M = np.empty((n, P), dtype=np.float32); M[:] = np.nan
         for j, m in enumerate(all_markers):
-            if m in col_map:
-                M[:, j] = col_map[m]
-            else:
-                M[:, j] = _extract_raw_column(data, m, ADT_location)
+            M[:, j] = col_map.get(m, _raw_marker_column(data, m, ADT_location))
 
-        # final NaN→raw
-        raw = mod_in.X
+        raw = data.mod[ADT_location].X
         raw_np = raw.toarray() if hasattr(raw, "toarray") else np.asarray(raw)
         bad = ~np.isfinite(M)
         if bad.any():
+            if verbose:
+                _log(f"Final guard: {int(bad.sum())} NaN/inf values → raw fallback")
             M[bad] = raw_np[bad]
 
-        # create/overwrite modality for return
-        data.mod[return_location] = mod_in[:, all_markers].copy()
+        data.mod[return_location] = data.mod[ADT_location][:, all_markers].copy()
         data.mod[return_location].X = M
-        _log(f"created modality '{return_location}' with shape {M.shape}", enable=verbose)
+        if verbose:
+            _log(f"Done. Wrote modality '{return_location}' with shape {M.shape}")
         return data
 
-    # DataFrame
-    df = pd.DataFrame(index=data.index, columns=all_markers, dtype=np.float32)
-    for m in all_markers:
-        df[m] = col_map.get(m, data[m].astype(np.float32).values)
-    _log(f"built DataFrame result with shape {df.shape}", enable=verbose)
-    return df
-
-
+    else:  # DataFrame input/output
+        df = pd.DataFrame(index=data.index, columns=all_markers, dtype=np.float32)
+        for m in all_markers:
+            df[m] = col_map.get(m, data[m].astype(np.float32).values)
+        if verbose:
+            _log(f"Done. Returning DataFrame with shape {df.shape}")
+        return df
