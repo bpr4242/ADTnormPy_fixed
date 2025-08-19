@@ -12,10 +12,9 @@ except ImportError:
 import rpy2.robjects
 import rpy2.robjects.pandas2ri
 import rpy2.robjects.packages
-import os
-
+import os,sys, tempfile
+from joblib import Parallel, delayed
 from typing import Union, Optional, Sequence, Any, Mapping, List, Tuple, Callable, List, Set, Iterable, Dict
-
 def adtnorm(data: Union[pd.DataFrame,anndata.AnnData,mudata.MuData],
             sample_column: str = 'sample',
             marker_to_process: Optional[Union[str,List[str]]] = None,
@@ -340,10 +339,6 @@ def load_python_landmarks(load_dir, study_name='ADTnormPy', append_csv=True):
             res[marker][f'{file_items[0]}_landmark_list'] = pd.read_csv(load_dir+'/'+filename,index_col=0)
 
     return res
-
-import pandas as pd
-import os, sys, tempfile
-from typing import Optional, List
 
 # ---------- tiny logging helpers ----------
 def _log(msg: str, marker: str = None, ts: bool = False):
