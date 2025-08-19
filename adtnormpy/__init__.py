@@ -1,1 +1,1 @@
-from .ADTnormPy import adtnorm, install_adtnorm_R, landmarks_to_r, landmarks_to_python, save_python_landmarks, load_python_landmarks
+from .ADTnormPy import adtnorm, install_adtnorm_R, landmarks_to_r, landmarks_to_python, save_python_landmarks, load_python_landmarks, run_marker_parallel
