@@ -340,8 +340,7 @@ def load_python_landmarks(load_dir, study_name='ADTnormPy', append_csv=True):
             res[marker][f'{file_items[0]}_landmark_list'] = pd.read_csv(load_dir+'/'+filename,index_col=0)
 
     return res
-from joblib import Parallel, delayed
-import numpy as np
+
 import pandas as pd
 import os, sys, tempfile
 from typing import Optional, List
@@ -387,8 +386,7 @@ def _r_capture_context(stdout_path: str, stderr_path: str):
 
 # ---------- helpers to extract columns & raw fallbacks ----------
 def _extract_marker_column_from_result(res, marker: str, return_location: str):
-    import numpy as np
-    import anndata
+
     # AnnData
     if isinstance(res, anndata.AnnData):
         arr = res.layers[return_location] if return_location in res.layers else res.X
@@ -404,8 +402,7 @@ def _extract_marker_column_from_result(res, marker: str, return_location: str):
     return res[marker].to_numpy(dtype=np.float32)
 
 def _raw_marker_column(data, marker: str, ADT_location: Optional[str] = 'protein'):
-    import numpy as np
-    import anndata
+
     # AnnData
     if isinstance(data, anndata.AnnData):
         if ADT_location is None:
