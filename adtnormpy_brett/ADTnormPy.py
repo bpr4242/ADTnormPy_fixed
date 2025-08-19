@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import anndata
+import shutil
 try:
     import mudata
 except ImportError:
@@ -367,16 +368,47 @@ def _print_r_file(path: str, marker: str):
 def _r_capture_context(stdout_path: str, stderr_path: str):
     import contextlib
     import rpy2.robjects as ro
+
     @contextlib.contextmanager
     def _ctx():
-        ro.r(f'sink("{stdout_path}", type="output")')
-        ro.r(f'sink("{stderr_path}", type="message")')
+        file_fun = ro.r["file"]
+        sink_fun = ro.r["sink"]
+        close_fun = ro.r["close"]
+        sink_number = ro.r["sink.number"]
+
+        # 1) PRE-DRAIN any existing sinks in this R session (avoids "sink stack is full")
+        try:
+            while int(sink_number(type="output")[0]) > 0:
+                sink_fun(None, type="output")
+            while int(sink_number(type="message")[0]) > 0:
+                sink_fun(None, type="message")
+        except Exception:
+            # ignore—older R versions may behave slightly differently
+            pass
+
+        # 2) OPEN real connections (fixes "'file' must be NULL..." errors)
+        out_con = file_fun(stdout_path, open="wt")
+        err_con = file_fun(stderr_path, open="wt")
+
+        # 3) SINK both streams to those connections
+        sink_fun(out_con, type="output")
+        sink_fun(err_con, type="message")
         try:
             yield
         finally:
-            # drain all sinks safely
-            ro.r('while (sink.number(type="output")>0) sink(NULL, type="output")')
-            ro.r('while (sink.number(type="message")>0) sink(NULL, type="message")')
+            # 4) ALWAYS unwind all sinks (even if ADTnorm internally nested more sink() calls)
+            try:
+                while int(sink_number(type="output")[0]) > 0:
+                    sink_fun(None, type="output")
+                while int(sink_number(type="message")[0]) > 0:
+                    sink_fun(None, type="message")
+            finally:
+                # 5) CLOSE connections
+                try: close_fun(out_con)
+                except Exception: pass
+                try: close_fun(err_con)
+                except Exception: pass
+
     return _ctx()
 
 # ---------- helpers to extract columns & raw fallbacks ----------
@@ -426,14 +458,9 @@ def _run_one_marker_verbose(marker: str,
                             show_params: bool = True,
                             timestamp_logs: bool = True,
                             **kwargs):
-    """
-    Runs your existing `adtnorm()` for a single marker with:
-     - R verbosity forced via verbose=r_verbose_level
-     - R stdout/stderr captured and reprinted with [marker] prefix
-     - raw fallback on failure
-    """
     from copy import deepcopy
     import traceback
+    import shutil
 
     _log("Starting", marker=marker, ts=timestamp_logs)
     if show_params:
@@ -441,16 +468,13 @@ def _run_one_marker_verbose(marker: str,
         _log(f"Params: sample_column={sample_column}, ADT_location={ADT_location}, return_location={return_location}"
              + (f" | extra: {params_str}" if params_str else ""), marker=marker, ts=timestamp_logs)
 
-    # each worker gets its own temp files for R sinks
     tmpdir = tempfile.mkdtemp(prefix=f"adtnorm_{marker}_")
     r_out = os.path.join(tmpdir, "R_stdout.txt")
     r_err = os.path.join(tmpdir, "R_stderr.txt")
 
     try:
-        # shallow copy avoids mutating caller's object in workers
         d = data.copy()
 
-        # capture ALL R chatter
         with _r_capture_context(r_out, r_err):
             res = adtnorm(
                 data=d,
@@ -458,17 +482,15 @@ def _run_one_marker_verbose(marker: str,
                 marker_to_process=[marker],
                 ADT_location=ADT_location,
                 return_location=return_location,
-                customize_landmark=False,         # must be non-interactive in parallel
-                verbose=r_verbose_level,          # 2 => True inside your _adtnorm(), prints like original
+                customize_landmark=False,
+                verbose=r_verbose_level,
                 **kwargs
             )
 
-        # print captured R logs with prefixes
         _print_r_file(r_out, marker)
         _print_r_file(r_err, marker)
 
         col = _extract_marker_column_from_result(res, marker, return_location)
-        # final guard: replace any NaN with raw
         if not np.isfinite(col).all():
             _log("NaNs detected in normalized values, replacing with raw.", marker=marker)
             raw = _raw_marker_column(data, marker, ADT_location)
@@ -479,12 +501,18 @@ def _run_one_marker_verbose(marker: str,
 
     except Exception as e:
         _log(f"ERROR: {type(e).__name__}: {e}", marker=marker, ts=timestamp_logs)
-        # try to flush R logs even on error
         _print_r_file(r_out, marker)
         _print_r_file(r_err, marker)
         _log("Falling back to RAW for this marker.", marker=marker)
         raw = _raw_marker_column(data, marker, ADT_location)
         return marker, raw
+
+    finally:
+        # always remove the temp directory
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 # ---------- public API: parallel per-marker (or small chunks) ----------
 def adtnorm_parallel_markers(data,
